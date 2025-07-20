@@ -1,10 +1,12 @@
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
 import gleam/option.{None}
+import gleam/otp/actor
 import gleam/result
 import gleam/string
 import glisten.{Packet}
@@ -23,8 +25,6 @@ pub type ParseResult {
 }
 
 pub fn parse_resp(input: String) -> Result(ParseResult, String) {
-  echo input
-
   case string.first(input) {
     Ok("+") -> parse_simple_string(string.drop_start(input, 1))
     Ok("-") -> parse_error(string.drop_start(input, 1))
@@ -177,41 +177,127 @@ pub fn uppercase_first(arr: List(String)) -> List(String) {
   }
 }
 
+fn command_to_list(msg: BitArray) -> Result(List(String), String) {
+  bit_array.to_string(msg)
+  |> result.unwrap("")
+  |> parse_command()
+}
+
+fn process_ping(conn, state) {
+  let response = SimpleString("PONG") |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  state
+}
+
+fn process_echo(conn, rest, state) {
+  list.map(rest, fn(s) {
+    let response = BulkString(s) |> resp_to_string()
+    let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  })
+  state
+}
+
+fn process_set(conn, key: String, value: String, state, actor_subject) {
+  set_value(actor_subject, key, value)
+  let response = SimpleString("OK") |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  dict.insert(state, key, value)
+}
+
+fn process_get(conn, key: String, state, actor_subject) {
+  let _ = case get_value(actor_subject, key) {
+    Error(_) -> {
+      let response = Null |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    Ok(value) -> {
+      let response = BulkString(value) |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+  }
+  state
+}
+
+// Define your actor state
+pub type State {
+  State(data: dict.Dict(String, String))
+}
+
+// Define your message types
+pub type Message {
+  Get(key: String, reply_with: process.Subject(Result(String, Nil)))
+  Set(key: String, value: String)
+}
+
+// Actor loop function
+fn handle_message(state: State, message: Message) {
+  case message {
+    Get(key, client) -> {
+      let result = dict.get(state.data, key)
+      actor.send(client, result)
+      actor.continue(state)
+    }
+    Set(key, value) -> {
+      let new_data = dict.insert(state.data, key, value)
+      let new_state = State(data: new_data)
+      actor.continue(new_state)
+    }
+  }
+}
+
+// Start the actor
+pub fn start() {
+  let assert Ok(actor) =
+    actor.new(State(data: dict.new()))
+    |> actor.on_message(handle_message)
+    |> actor.start()
+  actor.data
+}
+
+// Get a value from the actor (blocks until response)
+pub fn get_value(
+  actor_subject: process.Subject(Message),
+  key: String,
+) -> Result(String, Nil) {
+  actor.call(actor_subject, 5000, Get(key, _))
+  // 5 second timeout
+}
+
+// Set a value (fire and forget)
+pub fn set_value(
+  actor_subject: process.Subject(Message),
+  key: String,
+  value: String,
+) -> Nil {
+  actor.send(actor_subject, Set(key, value))
+}
+
 pub fn main() {
-  io.println("Redis: Gleam Edition 0.0.1")
+  io.println("Redis: Gleam Edition 0.0.2")
 
+  let actor_subject = start()
   let assert Ok(_) =
-    glisten.new(fn(_conn) { #(Nil, None) }, fn(state, msg, conn) {
+    glisten.new(fn(_conn) { #(dict.new(), None) }, fn(state, msg, conn) {
+      echo state
       let assert Packet(msg) = msg
+      let commands = command_to_list(msg)
 
-      let commands =
-        bit_array.to_string(msg)
-        |> echo
-        |> result.unwrap("")
-        |> parse_command()
-
-      let assert Ok(_) =
-        result.map(over: commands, with: fn(command) {
+      case commands {
+        Error(_) -> glisten.continue(state)
+        Ok(command) -> {
           command |> echo
-          case command |> uppercase_first() {
-            ["PING"] -> {
-              let response = SimpleString("PONG") |> resp_to_string()
-              let assert Ok(_) =
-                glisten.send(conn, bytes_tree.from_string(response))
-              Ok(Nil)
-            }
-            ["ECHO", ..rest] -> {
-              list.map(rest, fn(s) {
-                let response = BulkString(s) |> resp_to_string()
-                let assert Ok(_) =
-                  glisten.send(conn, bytes_tree.from_string(response))
-              })
-              Ok(Nil)
-            }
-            _ -> Ok(Nil)
+          let new_state = case command |> uppercase_first() {
+            ["PING"] -> process_ping(conn, state)
+            ["ECHO", ..rest] -> process_echo(conn, rest, state)
+            ["SET", key, value] ->
+              process_set(conn, key, value, state, actor_subject)
+            ["GET", key] -> process_get(conn, key, state, actor_subject)
+            _ -> state
           }
-        })
-      glisten.continue(state)
+          echo new_state
+          glisten.continue(new_state)
+        }
+      }
     })
     |> glisten.bind("0.0.0.0")
     |> glisten.start(6379)
