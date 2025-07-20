@@ -1,3 +1,5 @@
+import birl
+import birl/duration
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
@@ -6,10 +8,18 @@ import gleam/int
 import gleam/io
 import gleam/list
 import gleam/option.{None}
+import gleam/order
 import gleam/otp/actor
 import gleam/result
 import gleam/string
 import glisten.{Packet}
+
+const version = "0.0.4"
+
+pub type StoredValue {
+  StoredString(String)
+  StoredStringWithTTL(String, birl.Time)
+}
 
 pub type RespValue {
   SimpleString(String)
@@ -197,10 +207,37 @@ fn process_echo(conn, rest) {
   Nil
 }
 
-fn process_set(conn, key: String, value: String, actor_subject) {
-  set_value(actor_subject, key, value)
-  let response = SimpleString("OK") |> resp_to_string()
-  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+fn process_set_with_ttl(
+  conn,
+  key: String,
+  value: String,
+  ttl: String,
+  actor_subject,
+) {
+  let _ = case string.is_empty(ttl) {
+    True -> {
+      // No TTL
+      set_value(actor_subject, key, StoredString(value))
+      let response = SimpleString("OK") |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    False -> {
+      // With TTL
+      let ttl =
+        ttl
+        |> int.parse
+        |> result.unwrap(0)
+        |> echo
+
+      let now = birl.now()
+      let expire = birl.add(now, duration.milli_seconds(ttl))
+      let stored = StoredStringWithTTL(value, expire)
+
+      set_value(actor_subject, key, stored)
+      let response = SimpleString("OK") |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+  }
   Nil
 }
 
@@ -211,8 +248,29 @@ fn process_get(conn, key: String, actor_subject) {
       let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
     Ok(value) -> {
-      let response = BulkString(value) |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      case value {
+        StoredString(s) -> {
+          let response = BulkString(s) |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
+        StoredStringWithTTL(s, e) -> {
+          let now = birl.now()
+          case birl.compare(now, e) {
+            order.Eq | order.Gt -> {
+              let _ = delete_value(actor_subject, key)
+              let response = Null |> resp_to_string()
+              let assert Ok(_) =
+                glisten.send(conn, bytes_tree.from_string(response))
+            }
+            order.Lt -> {
+              let response = BulkString(s) |> resp_to_string()
+              let assert Ok(_) =
+                glisten.send(conn, bytes_tree.from_string(response))
+            }
+          }
+        }
+      }
     }
   }
   Nil
@@ -220,17 +278,20 @@ fn process_get(conn, key: String, actor_subject) {
 
 // Define your actor state
 pub type State {
-  State(data: dict.Dict(String, String))
+  State(data: dict.Dict(String, StoredValue))
 }
 
 // Define your message types
 pub type Message {
-  Get(key: String, reply_with: process.Subject(Result(String, Nil)))
-  Set(key: String, value: String)
+  Delete(key: String)
+  Get(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
+  Set(key: String, value: StoredValue)
 }
 
 // Actor loop function
 fn handle_message(state: State, message: Message) {
+  echo state
+
   case message {
     Get(key, client) -> {
       let result = dict.get(state.data, key)
@@ -239,6 +300,11 @@ fn handle_message(state: State, message: Message) {
     }
     Set(key, value) -> {
       let new_data = dict.insert(state.data, key, value)
+      let new_state = State(data: new_data)
+      actor.continue(new_state)
+    }
+    Delete(key) -> {
+      let new_data = dict.delete(state.data, key)
       let new_state = State(data: new_data)
       actor.continue(new_state)
     }
@@ -258,22 +324,25 @@ pub fn start() {
 pub fn get_value(
   actor_subject: process.Subject(Message),
   key: String,
-) -> Result(String, Nil) {
+) -> Result(StoredValue, Nil) {
   actor.call(actor_subject, 5000, Get(key, _))
-  // 5 second timeout
+}
+
+pub fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil {
+  actor.send(actor_subject, Delete(key))
 }
 
 // Set a value (fire and forget)
 pub fn set_value(
   actor_subject: process.Subject(Message),
   key: String,
-  value: String,
+  value: StoredValue,
 ) -> Nil {
   actor.send(actor_subject, Set(key, value))
 }
 
 pub fn main() {
-  io.println("Redis: Gleam Edition 0.0.3")
+  io.println("Redis: Gleam Edition " <> version)
 
   let actor_subject = start()
   let assert Ok(_) =
@@ -288,7 +357,10 @@ pub fn main() {
           case command |> uppercase_first() {
             ["PING"] -> process_ping(conn)
             ["ECHO", ..rest] -> process_echo(conn, rest)
-            ["SET", key, value] -> process_set(conn, key, value, actor_subject)
+            ["SET", key, value] ->
+              process_set_with_ttl(conn, key, value, "", actor_subject)
+            ["SET", key, value, "px", ttl] ->
+              process_set_with_ttl(conn, key, value, ttl, actor_subject)
             ["GET", key] -> process_get(conn, key, actor_subject)
             _ -> Nil
           }
