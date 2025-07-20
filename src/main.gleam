@@ -183,28 +183,28 @@ fn command_to_list(msg: BitArray) -> Result(List(String), String) {
   |> parse_command()
 }
 
-fn process_ping(conn, state) {
+fn process_ping(conn) {
   let response = SimpleString("PONG") |> resp_to_string()
   let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-  state
+  Nil
 }
 
-fn process_echo(conn, rest, state) {
+fn process_echo(conn, rest) {
   list.map(rest, fn(s) {
     let response = BulkString(s) |> resp_to_string()
     let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
   })
-  state
+  Nil
 }
 
-fn process_set(conn, key: String, value: String, state, actor_subject) {
+fn process_set(conn, key: String, value: String, actor_subject) {
   set_value(actor_subject, key, value)
   let response = SimpleString("OK") |> resp_to_string()
   let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-  dict.insert(state, key, value)
+  Nil
 }
 
-fn process_get(conn, key: String, state, actor_subject) {
+fn process_get(conn, key: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> {
       let response = Null |> resp_to_string()
@@ -215,7 +215,7 @@ fn process_get(conn, key: String, state, actor_subject) {
       let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
   }
-  state
+  Nil
 }
 
 // Define your actor state
@@ -273,12 +273,11 @@ pub fn set_value(
 }
 
 pub fn main() {
-  io.println("Redis: Gleam Edition 0.0.2")
+  io.println("Redis: Gleam Edition 0.0.3")
 
   let actor_subject = start()
   let assert Ok(_) =
     glisten.new(fn(_conn) { #(dict.new(), None) }, fn(state, msg, conn) {
-      echo state
       let assert Packet(msg) = msg
       let commands = command_to_list(msg)
 
@@ -286,16 +285,14 @@ pub fn main() {
         Error(_) -> glisten.continue(state)
         Ok(command) -> {
           command |> echo
-          let new_state = case command |> uppercase_first() {
-            ["PING"] -> process_ping(conn, state)
-            ["ECHO", ..rest] -> process_echo(conn, rest, state)
-            ["SET", key, value] ->
-              process_set(conn, key, value, state, actor_subject)
-            ["GET", key] -> process_get(conn, key, state, actor_subject)
-            _ -> state
+          case command |> uppercase_first() {
+            ["PING"] -> process_ping(conn)
+            ["ECHO", ..rest] -> process_echo(conn, rest)
+            ["SET", key, value] -> process_set(conn, key, value, actor_subject)
+            ["GET", key] -> process_get(conn, key, actor_subject)
+            _ -> Nil
           }
-          echo new_state
-          glisten.continue(new_state)
+          glisten.continue(state)
         }
       }
     })
