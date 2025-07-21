@@ -1,5 +1,3 @@
-import birl
-import birl/duration
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
@@ -12,13 +10,17 @@ import gleam/order
 import gleam/otp/actor
 import gleam/result
 import gleam/string
+import gleam/time/duration
+import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.0.4"
+const version = "0.0.5"
+
+const heartbeat_interval = 5000
 
 pub type StoredValue {
   StoredString(String)
-  StoredStringWithTTL(String, birl.Time)
+  StoredStringWithTTL(String, timestamp.Timestamp)
 }
 
 pub type RespValue {
@@ -229,8 +231,8 @@ fn process_set_with_ttl(
         |> result.unwrap(0)
         |> echo
 
-      let now = birl.now()
-      let expire = birl.add(now, duration.milli_seconds(ttl))
+      let now = timestamp.system_time()
+      let expire = timestamp.add(now, duration.milliseconds(ttl))
       let stored = StoredStringWithTTL(value, expire)
 
       set_value(actor_subject, key, stored)
@@ -255,8 +257,8 @@ fn process_get(conn, key: String, actor_subject) {
             glisten.send(conn, bytes_tree.from_string(response))
         }
         StoredStringWithTTL(s, e) -> {
-          let now = birl.now()
-          case birl.compare(now, e) {
+          let now = timestamp.system_time()
+          case timestamp.compare(now, e) {
             order.Eq | order.Gt -> {
               let _ = delete_value(actor_subject, key)
               let response = Null |> resp_to_string()
@@ -283,6 +285,7 @@ pub type State {
 
 // Define your message types
 pub type Message {
+  Heartbeat(subject: process.Subject(Message), delay: Int)
   Delete(key: String)
   Get(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
   Set(key: String, value: StoredValue)
@@ -290,9 +293,39 @@ pub type Message {
 
 // Actor loop function
 fn handle_message(state: State, message: Message) {
-  echo state
-
   case message {
+    Heartbeat(subject, delay) -> {
+      let now =
+        timestamp.system_time()
+        |> timestamp.to_rfc3339(duration.hours(0))
+        |> string.pad_end(to: 30, with: "0")
+      io.println("[" <> now <> "] Actor heartbeat...")
+
+      let new_data =
+        dict.filter(state.data, fn(_, value) -> Bool {
+          case value {
+            StoredString(_) -> True
+            StoredStringWithTTL(key, expire) -> {
+              case
+                duration.to_seconds(timestamp.difference(
+                  timestamp.system_time(),
+                  expire,
+                ))
+                >=. 0.0
+              {
+                False -> {
+                  io.println("TTL Expired for: " <> key)
+                  False
+                }
+                True -> True
+              }
+            }
+          }
+        })
+      let new_state = State(data: new_data)
+      process.send_after(subject, delay, Heartbeat(subject, delay))
+      actor.continue(new_state)
+    }
     Get(key, client) -> {
       let result = dict.get(state.data, key)
       actor.send(client, result)
@@ -345,6 +378,11 @@ pub fn main() {
   io.println("Redis: Gleam Edition " <> version)
 
   let actor_subject = start()
+  process.send_after(
+    actor_subject,
+    heartbeat_interval,
+    Heartbeat(actor_subject, heartbeat_interval),
+  )
   let assert Ok(_) =
     glisten.new(fn(_conn) { #(dict.new(), None) }, fn(state, msg, conn) {
       let assert Packet(msg) = msg
