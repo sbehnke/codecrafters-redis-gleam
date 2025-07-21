@@ -286,11 +286,22 @@ fn process_get(conn, key: String, actor_subject) {
   Nil
 }
 
-pub fn process_list_append(conn, key, value, actor_subject) {
-  append_list_value(actor_subject, key, StoredString(value))
-  let length = get_list_length(actor_subject, key) |> result.unwrap(0)
-  let response = Integer(length) |> resp_to_string()
-  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+pub fn process_list_append(conn, key, values: List(String), actor_subject) {
+  let _ = case list.is_empty(values) {
+    False -> {
+      list.map(values, fn(value) {
+        append_list_value(actor_subject, key, StoredString(value))
+      })
+      let length = get_list_length(actor_subject, key) |> result.unwrap(0)
+      let response = Integer(length) |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    True -> {
+      let response = RedisError("Cannot push empty list") |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+  }
+
   Nil
 }
 
@@ -475,8 +486,8 @@ pub fn main() {
               process_set_with_ttl(conn, key, value, ttl, actor_subject)
             ["GET", key] -> process_get(conn, key, actor_subject)
             // RPUSH list_key "foo"
-            ["RPUSH", key, value] ->
-              process_list_append(conn, key, value, actor_subject)
+            ["RPUSH", key, ..values] ->
+              process_list_append(conn, key, values, actor_subject)
             _ -> Nil
           }
           glisten.continue(state)
