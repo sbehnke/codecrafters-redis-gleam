@@ -5,7 +5,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/order
 import gleam/otp/actor
 import gleam/result
@@ -305,6 +305,68 @@ pub fn process_list_append(conn, key, values: List(String), actor_subject) {
   Nil
 }
 
+pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
+  let _ = case get_value(actor_subject, key) {
+    Error(_) -> {
+      let response = Array([]) |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    Ok(value) -> {
+      case value {
+        StoredList(s) -> {
+          let from = from |> int.parse() |> result.unwrap(0)
+          let to = to |> int.parse() |> result.unwrap(0)
+
+          case from > to {
+            False -> {
+              let range = list.range(from, to)
+              let items =
+                list.fold(range, [], fn(acc, index) {
+                  let item = case list.drop(s, index) |> list.first {
+                    Error(_) -> None
+                    Ok(v) -> {
+                      case v {
+                        StoredString(s) -> Some(BulkString(s))
+                        _ -> None
+                      }
+                    }
+                  }
+                  case item {
+                    None -> acc
+                    Some(item) -> {
+                      list.append(acc, [item])
+                    }
+                  }
+                })
+
+              let response = Array(items) |> resp_to_string()
+              let assert Ok(_) =
+                glisten.send(conn, bytes_tree.from_string(response))
+            }
+            True -> {
+              let response = Array([]) |> resp_to_string()
+              let assert Ok(_) =
+                glisten.send(conn, bytes_tree.from_string(response))
+            }
+          }
+        }
+        _ -> {
+          let response = Array([]) |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
+      }
+    }
+  }
+  Nil
+}
+
+pub fn process_unknown_command(conn, cmd) {
+  let response = RedisError("Unsupported command " <> cmd) |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  Nil
+}
+
 // Define your actor state
 pub type State {
   State(data: dict.Dict(String, StoredValue))
@@ -488,7 +550,11 @@ pub fn main() {
             // RPUSH list_key "foo"
             ["RPUSH", key, ..values] ->
               process_list_append(conn, key, values, actor_subject)
-            _ -> Nil
+            ["LRANGE", key, from, to] ->
+              process_list_range(conn, key, from, to, actor_subject)
+
+            [c] -> process_unknown_command(conn, c)
+            _ -> process_unknown_command(conn, "UNKNOWN")
           }
           glisten.continue(state)
         }
