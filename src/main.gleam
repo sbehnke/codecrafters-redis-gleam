@@ -18,8 +18,11 @@ const version = "0.0.5"
 
 const heartbeat_interval = 5000
 
+const actor_timeout = 5000
+
 pub type StoredValue {
   StoredString(String)
+  StoredList(List(StoredValue))
   StoredStringWithTTL(String, timestamp.Timestamp)
 }
 
@@ -251,6 +254,11 @@ fn process_get(conn, key: String, actor_subject) {
     }
     Ok(value) -> {
       case value {
+        StoredList(_) -> {
+          let response = RedisError("Unimplemented") |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
         StoredString(s) -> {
           let response = BulkString(s) |> resp_to_string()
           let assert Ok(_) =
@@ -278,6 +286,14 @@ fn process_get(conn, key: String, actor_subject) {
   Nil
 }
 
+pub fn process_list_append(conn, key, value, actor_subject) {
+  append_list_value(actor_subject, key, StoredString(value))
+  let length = get_list_length(actor_subject, key) |> result.unwrap(0)
+  let response = Integer(length) |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  Nil
+}
+
 // Define your actor state
 pub type State {
   State(data: dict.Dict(String, StoredValue))
@@ -289,6 +305,8 @@ pub type Message {
   Delete(key: String)
   Get(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
   Set(key: String, value: StoredValue)
+  AppendList(key: String, value: StoredValue)
+  GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
 }
 
 // Actor loop function
@@ -304,6 +322,7 @@ fn handle_message(state: State, message: Message) {
       let new_data =
         dict.filter(state.data, fn(_, value) -> Bool {
           case value {
+            StoredList(_) -> True
             StoredString(_) -> True
             StoredStringWithTTL(key, expire) -> {
               case
@@ -336,6 +355,45 @@ fn handle_message(state: State, message: Message) {
       let new_state = State(data: new_data)
       actor.continue(new_state)
     }
+    AppendList(key, value) -> {
+      let new_data =
+        dict.upsert(state.data, key, fn(stored) {
+          case stored {
+            None -> {
+              StoredList([value])
+            }
+            option.Some(stored_value) -> {
+              case stored_value {
+                StoredList(l) -> {
+                  StoredList(list.append(l, [value]))
+                }
+                _ -> {
+                  StoredList([])
+                }
+              }
+            }
+          }
+        })
+      let new_state = State(data: new_data)
+      actor.continue(new_state)
+    }
+    GetListLength(key, client) -> {
+      let result = dict.get(state.data, key)
+      case result {
+        Error(_) -> actor.send(client, Ok(0))
+        Ok(stored) -> {
+          case stored {
+            StoredList(l) -> {
+              actor.send(client, Ok(list.length(l)))
+            }
+            _ -> {
+              actor.send(client, Ok(0))
+            }
+          }
+        }
+      }
+      actor.continue(state)
+    }
     Delete(key) -> {
       let new_data = dict.delete(state.data, key)
       let new_state = State(data: new_data)
@@ -358,7 +416,7 @@ pub fn get_value(
   actor_subject: process.Subject(Message),
   key: String,
 ) -> Result(StoredValue, Nil) {
-  actor.call(actor_subject, 5000, Get(key, _))
+  actor.call(actor_subject, actor_timeout, Get(key, _))
 }
 
 pub fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil {
@@ -372,6 +430,22 @@ pub fn set_value(
   value: StoredValue,
 ) -> Nil {
   actor.send(actor_subject, Set(key, value))
+}
+
+// Set a value (fire and forget)
+pub fn append_list_value(
+  actor_subject: process.Subject(Message),
+  key: String,
+  value: StoredValue,
+) -> Nil {
+  actor.send(actor_subject, AppendList(key, value))
+}
+
+pub fn get_list_length(
+  actor_subject: process.Subject(Message),
+  key: String,
+) -> Result(Int, Nil) {
+  actor.call(actor_subject, actor_timeout, GetListLength(key, _))
 }
 
 pub fn main() {
@@ -400,6 +474,9 @@ pub fn main() {
             ["SET", key, value, "px", ttl] ->
               process_set_with_ttl(conn, key, value, ttl, actor_subject)
             ["GET", key] -> process_get(conn, key, actor_subject)
+            // RPUSH list_key "foo"
+            ["RPUSH", key, value] ->
+              process_list_append(conn, key, value, actor_subject)
             _ -> Nil
           }
           glisten.continue(state)
