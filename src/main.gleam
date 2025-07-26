@@ -14,7 +14,7 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.0.5"
+const version = "0.0.6"
 
 const heartbeat_interval = 5000
 
@@ -305,6 +305,22 @@ pub fn process_list_append(conn, key, values: List(String), actor_subject) {
   Nil
 }
 
+// Legacy list.at which shouldn't actually be used anymore due to performace
+pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
+  case index < 0 {
+    True -> None
+    False ->
+      case list {
+        [] -> None
+        [x, ..rest] ->
+          case index == 0 {
+            True -> Some(x)
+            False -> list_at(rest, index - 1)
+          }
+      }
+  }
+}
+
 pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> {
@@ -316,15 +332,23 @@ pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
         StoredList(s) -> {
           let from = from |> int.parse() |> result.unwrap(0)
           let to = to |> int.parse() |> result.unwrap(0)
+          let length = list.length(s)
+
+          let #(to, from) = case to < 0, from < 0 {
+            True, True -> #(length + to, length + from)
+            True, False -> #(length + to, from)
+            False, True -> #(to, from + length)
+            False, False -> #(to, from)
+          }
 
           case from > to {
             False -> {
               let range = list.range(from, to)
               let items =
                 list.fold(range, [], fn(acc, index) {
-                  let item = case list.drop(s, index) |> list.first {
-                    Error(_) -> None
-                    Ok(v) -> {
+                  let item = case list_at(s, index) {
+                    None -> None
+                    Some(v) -> {
                       case v {
                         StoredString(s) -> Some(BulkString(s))
                         _ -> None
