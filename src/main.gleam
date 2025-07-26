@@ -14,7 +14,7 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.0.6"
+const version = "0.0.7"
 
 const heartbeat_interval = 5000
 
@@ -243,6 +243,14 @@ fn process_set_with_ttl(
       let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
   }
+  Nil
+}
+
+fn process_list_length(conn, key: String, actor_subject) {
+  let length = get_list_length(actor_subject, key) |> result.unwrap(0)
+  let response = Integer(length) |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+
   Nil
 }
 
@@ -627,9 +635,9 @@ pub fn main() {
             //LPUSH list_key "a" "b" "c"
             ["LPUSH", key, ..values] ->
               process_list_prepend(conn, key, values, actor_subject)
-
             ["LRANGE", key, from, to] ->
               process_list_range(conn, key, from, to, actor_subject)
+            ["LLEN", key] -> process_list_length(conn, key, actor_subject)
 
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
