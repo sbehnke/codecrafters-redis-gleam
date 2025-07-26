@@ -140,8 +140,7 @@ fn parse_array_elements(
   }
 }
 
-// Parse your specific example
-pub fn parse_command(input: String) -> Result(List(String), String) {
+fn parse_command(input: String) -> Result(List(String), String) {
   case parse_resp(input) {
     Ok(ParseResult(Array(elements), _)) -> {
       extract_strings(elements, [])
@@ -228,7 +227,7 @@ fn process_set_with_ttl(
         ttl
         |> int.parse
         |> result.unwrap(0)
-        |> echo
+      // |> echo
 
       let now = timestamp.system_time()
       let expire = timestamp.add(now, duration.milliseconds(ttl))
@@ -305,7 +304,7 @@ fn process_get(conn, key: String, actor_subject) {
   Nil
 }
 
-pub fn process_list_append(conn, key, values: List(String), actor_subject) {
+fn process_list_append(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
       list.map(values, fn(value) {
@@ -324,7 +323,7 @@ pub fn process_list_append(conn, key, values: List(String), actor_subject) {
   Nil
 }
 
-pub fn process_list_prepend(conn, key, values: List(String), actor_subject) {
+fn process_list_prepend(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
       list.map(values, fn(value) {
@@ -359,7 +358,7 @@ pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
   }
 }
 
-pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
+fn process_list_range(conn, key, from: String, to: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> {
       let response = Array([]) |> resp_to_string()
@@ -387,12 +386,10 @@ pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
                   case list_at(s, index) {
                     None -> acc
                     Some(v) -> {
-                      echo v
                       list.append(acc, [v])
                     }
                   }
                 })
-                |> echo
               let response = Array(items) |> resp_to_string()
               let assert Ok(_) =
                 glisten.send(conn, bytes_tree.from_string(response))
@@ -415,19 +412,17 @@ pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
   Nil
 }
 
-pub fn process_unknown_command(conn, cmd) {
+fn process_unknown_command(conn, cmd) {
   let response = RedisError("Unsupported command " <> cmd) |> resp_to_string()
   let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
   Nil
 }
 
-// Define your actor state
-pub type State {
+type State {
   State(data: dict.Dict(String, RespValue))
 }
 
-// Define your message types
-pub type Message {
+type Message {
   Heartbeat(subject: process.Subject(Message), delay: Int)
   Delete(key: String)
   Get(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
@@ -450,7 +445,7 @@ fn handle_message(state: State, message: Message) {
         timestamp.system_time()
         |> timestamp.to_rfc3339(duration.hours(0))
         |> string.pad_end(to: 30, with: "0")
-        |> echo
+      // |> echo
       // io.println("[" <> now <> "] Actor heartbeat...")
 
       let new_data =
@@ -606,7 +601,7 @@ fn handle_message(state: State, message: Message) {
 }
 
 // Start the actor
-pub fn start() {
+fn start() {
   let assert Ok(actor) =
     actor.new(State(data: dict.new()))
     |> actor.on_message(handle_message)
@@ -615,19 +610,19 @@ pub fn start() {
 }
 
 // Get a value from the actor (blocks until response)
-pub fn get_value(
+fn get_value(
   actor_subject: process.Subject(Message),
   key: String,
 ) -> Result(RespValue, Nil) {
   actor.call(actor_subject, actor_timeout, Get(key, _))
 }
 
-pub fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil {
+fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil {
   actor.send(actor_subject, Delete(key))
 }
 
 // Set a value (fire and forget)
-pub fn set_value(
+fn set_value(
   actor_subject: process.Subject(Message),
   key: String,
   value: RespValue,
@@ -636,7 +631,7 @@ pub fn set_value(
 }
 
 // Set a value (fire and forget)
-pub fn append_list_value(
+fn append_list_value(
   actor_subject: process.Subject(Message),
   key: String,
   value: RespValue,
@@ -644,7 +639,7 @@ pub fn append_list_value(
   actor.send(actor_subject, AppendList(key, value))
 }
 
-pub fn prepend_list_value(
+fn prepend_list_value(
   actor_subject: process.Subject(Message),
   key: String,
   value: RespValue,
@@ -652,14 +647,14 @@ pub fn prepend_list_value(
   actor.send(actor_subject, PrependList(key, value))
 }
 
-pub fn get_list_length(
+fn get_list_length(
   actor_subject: process.Subject(Message),
   key: String,
 ) -> Result(Int, Nil) {
   actor.call(actor_subject, actor_timeout, GetListLength(key, _))
 }
 
-pub fn pop_list(
+fn pop_list(
   actor_subject: process.Subject(Message),
   key: String,
   qty: String,
