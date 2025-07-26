@@ -14,18 +14,11 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.0.8"
+const version = "0.1.0"
 
 const heartbeat_interval = 5000
 
 const actor_timeout = 5000
-
-pub type StoredValue {
-  StoredString(String)
-  StoredList(List(StoredValue))
-  StoredStringWithTTL(String, timestamp.Timestamp)
-  Nil
-}
 
 pub type RespValue {
   SimpleString(String)
@@ -33,6 +26,7 @@ pub type RespValue {
   Integer(Int)
   BulkString(String)
   Array(List(RespValue))
+  WithTTL(RespValue, timestamp.Timestamp)
   Null
 }
 
@@ -172,6 +166,7 @@ fn extract_strings(
 // Convert RespValue back to string (for debugging)
 pub fn resp_to_string(value: RespValue) -> String {
   case value {
+    WithTTL(r, _) -> resp_to_string(r)
     SimpleString(s) -> "+" <> s <> "\r\n"
     RedisError(s) -> "-" <> s <> "\r\n"
     Integer(i) -> ":" <> int.to_string(i) <> "\r\n"
@@ -223,7 +218,7 @@ fn process_set_with_ttl(
   let _ = case string.is_empty(ttl) {
     True -> {
       // No TTL
-      set_value(actor_subject, key, StoredString(value))
+      set_value(actor_subject, key, BulkString(value))
       let response = SimpleString("OK") |> resp_to_string()
       let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
@@ -237,7 +232,7 @@ fn process_set_with_ttl(
 
       let now = timestamp.system_time()
       let expire = timestamp.add(now, duration.milliseconds(ttl))
-      let stored = StoredStringWithTTL(value, expire)
+      let stored = WithTTL(BulkString(value), expire)
 
       set_value(actor_subject, key, stored)
       let response = SimpleString("OK") |> resp_to_string()
@@ -263,27 +258,8 @@ fn process_list_pop(conn, key: String, actor_subject) {
       let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
     Ok(value) -> {
-      case value {
-        Nil -> {
-          let response = Null |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
-        StoredList(_l) -> {
-          // TODO: Fix this
-          let response = Null |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-          // let response = Array(l) |> resp_to_string()
-          // let assert Ok(_) =
-          //   glisten.send(conn, bytes_tree.from_string(response))
-        }
-        StoredString(s) | StoredStringWithTTL(s, _) -> {
-          let response = BulkString(s) |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
-      }
+      let response = value |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
     }
   }
   Nil
@@ -297,22 +273,17 @@ fn process_get(conn, key: String, actor_subject) {
     }
     Ok(value) -> {
       case value {
-        Nil -> {
-          let response = Null |> resp_to_string()
+        Array(_)
+        | BulkString(_)
+        | Integer(_)
+        | RedisError(_)
+        | SimpleString(_)
+        | Null -> {
+          let response = value |> resp_to_string()
           let assert Ok(_) =
             glisten.send(conn, bytes_tree.from_string(response))
         }
-        StoredList(_) -> {
-          let response = RedisError("Unimplemented") |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
-        StoredString(s) -> {
-          let response = BulkString(s) |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
-        StoredStringWithTTL(s, e) -> {
+        WithTTL(value, e) -> {
           let now = timestamp.system_time()
           case timestamp.compare(now, e) {
             order.Eq | order.Gt -> {
@@ -322,7 +293,7 @@ fn process_get(conn, key: String, actor_subject) {
                 glisten.send(conn, bytes_tree.from_string(response))
             }
             order.Lt -> {
-              let response = BulkString(s) |> resp_to_string()
+              let response = value |> resp_to_string()
               let assert Ok(_) =
                 glisten.send(conn, bytes_tree.from_string(response))
             }
@@ -338,7 +309,7 @@ pub fn process_list_append(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
       list.map(values, fn(value) {
-        append_list_value(actor_subject, key, StoredString(value))
+        append_list_value(actor_subject, key, BulkString(value))
       })
       let length = get_list_length(actor_subject, key) |> result.unwrap(0)
       let response = Integer(length) |> resp_to_string()
@@ -357,7 +328,7 @@ pub fn process_list_prepend(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
       list.map(values, fn(value) {
-        prepend_list_value(actor_subject, key, StoredString(value))
+        prepend_list_value(actor_subject, key, BulkString(value))
       })
       let length = get_list_length(actor_subject, key) |> result.unwrap(0)
       let response = Integer(length) |> resp_to_string()
@@ -396,7 +367,7 @@ pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
     }
     Ok(value) -> {
       case value {
-        StoredList(s) -> {
+        Array(s) -> {
           let from = from |> int.parse() |> result.unwrap(0)
           let to = to |> int.parse() |> result.unwrap(0)
           let length = list.length(s)
@@ -408,33 +379,25 @@ pub fn process_list_range(conn, key, from: String, to: String, actor_subject) {
             False, False -> #(to, from)
           }
 
-          case from > to {
-            False -> {
+          case from < to {
+            True -> {
               let range = list.range(from, to)
               let items =
                 list.fold(range, [], fn(acc, index) {
-                  let item = case list_at(s, index) {
-                    None -> None
-                    Some(v) -> {
-                      case v {
-                        StoredString(s) -> Some(BulkString(s))
-                        _ -> None
-                      }
-                    }
-                  }
-                  case item {
+                  case list_at(s, index) {
                     None -> acc
-                    Some(item) -> {
-                      list.append(acc, [item])
+                    Some(v) -> {
+                      echo v
+                      list.append(acc, [v])
                     }
                   }
                 })
-
+                |> echo
               let response = Array(items) |> resp_to_string()
               let assert Ok(_) =
                 glisten.send(conn, bytes_tree.from_string(response))
             }
-            True -> {
+            False -> {
               let response = Array([]) |> resp_to_string()
               let assert Ok(_) =
                 glisten.send(conn, bytes_tree.from_string(response))
@@ -460,38 +423,44 @@ pub fn process_unknown_command(conn, cmd) {
 
 // Define your actor state
 pub type State {
-  State(data: dict.Dict(String, StoredValue))
+  State(data: dict.Dict(String, RespValue))
 }
 
 // Define your message types
 pub type Message {
   Heartbeat(subject: process.Subject(Message), delay: Int)
   Delete(key: String)
-  Get(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
-  Set(key: String, value: StoredValue)
-  AppendList(key: String, value: StoredValue)
-  PrependList(key: String, value: StoredValue)
+  Get(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
+  Set(key: String, value: RespValue)
+  AppendList(key: String, value: RespValue)
+  PrependList(key: String, value: RespValue)
   GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
-  PopList(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
+  PopList(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
 }
 
 // Actor loop function
 fn handle_message(state: State, message: Message) {
   case message {
     Heartbeat(subject, delay) -> {
-      let now =
+      let _now =
         timestamp.system_time()
         |> timestamp.to_rfc3339(duration.hours(0))
         |> string.pad_end(to: 30, with: "0")
-      io.println("[" <> now <> "] Actor heartbeat...")
+        |> echo
+      // io.println("[" <> now <> "] Actor heartbeat...")
 
       let new_data =
-        dict.filter(state.data, fn(_, value) -> Bool {
+        dict.filter(state.data, fn(key, value) -> Bool {
           case value {
-            Nil -> False
-            StoredList(_) -> True
-            StoredString(_) -> True
-            StoredStringWithTTL(key, expire) -> {
+            Array(_)
+            | BulkString(_)
+            | Integer(_)
+            | Null
+            | RedisError(_)
+            | SimpleString(_) -> {
+              True
+            }
+            WithTTL(_, expire) -> {
               case
                 duration.to_seconds(timestamp.difference(
                   timestamp.system_time(),
@@ -500,7 +469,7 @@ fn handle_message(state: State, message: Message) {
                 >=. 0.0
               {
                 False -> {
-                  io.println("TTL Expired for: " <> key)
+                  io.println("TTL expired for: " <> key)
                   False
                 }
                 True -> True
@@ -527,15 +496,15 @@ fn handle_message(state: State, message: Message) {
         dict.upsert(state.data, key, fn(stored) {
           case stored {
             None -> {
-              StoredList([value])
+              Array([value])
             }
             option.Some(stored_value) -> {
               case stored_value {
-                StoredList(l) -> {
-                  StoredList([value, ..l])
+                Array(l) -> {
+                  Array([value, ..l])
                 }
                 _ -> {
-                  StoredList([])
+                  Array([])
                 }
               }
             }
@@ -549,15 +518,15 @@ fn handle_message(state: State, message: Message) {
         dict.upsert(state.data, key, fn(stored) {
           case stored {
             None -> {
-              StoredList([value])
+              Array([value])
             }
             option.Some(stored_value) -> {
               case stored_value {
-                StoredList(l) -> {
-                  StoredList(list.append(l, [value]))
+                Array(l) -> {
+                  Array(list.append(l, [value]))
                 }
                 _ -> {
-                  StoredList([])
+                  Array([])
                 }
               }
             }
@@ -572,7 +541,7 @@ fn handle_message(state: State, message: Message) {
         Error(_) -> actor.send(client, Ok(0))
         Ok(stored) -> {
           case stored {
-            StoredList(l) -> {
+            Array(l) -> {
               actor.send(client, Ok(list.length(l)))
             }
             _ -> {
@@ -587,23 +556,23 @@ fn handle_message(state: State, message: Message) {
       let result = dict.get(state.data, key)
       let new_state = case result {
         Error(_) -> {
-          actor.send(client, Ok(Nil))
+          actor.send(client, Ok(Null))
           state
         }
         Ok(stored) -> {
           case stored {
-            StoredList(l) -> {
+            Array(l) -> {
               let new_list = case l {
                 [first, ..rest] -> {
                   actor.send(client, Ok(first))
                   rest
                 }
                 [] -> {
-                  actor.send(client, Ok(Nil))
+                  actor.send(client, Ok(Null))
                   []
                 }
               }
-              let new_data = dict.insert(state.data, key, StoredList(new_list))
+              let new_data = dict.insert(state.data, key, Array(new_list))
               State(data: new_data)
             }
             _ -> state
@@ -634,7 +603,7 @@ pub fn start() {
 pub fn get_value(
   actor_subject: process.Subject(Message),
   key: String,
-) -> Result(StoredValue, Nil) {
+) -> Result(RespValue, Nil) {
   actor.call(actor_subject, actor_timeout, Get(key, _))
 }
 
@@ -646,7 +615,7 @@ pub fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil
 pub fn set_value(
   actor_subject: process.Subject(Message),
   key: String,
-  value: StoredValue,
+  value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, Set(key, value))
 }
@@ -655,7 +624,7 @@ pub fn set_value(
 pub fn append_list_value(
   actor_subject: process.Subject(Message),
   key: String,
-  value: StoredValue,
+  value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, AppendList(key, value))
 }
@@ -663,7 +632,7 @@ pub fn append_list_value(
 pub fn prepend_list_value(
   actor_subject: process.Subject(Message),
   key: String,
-  value: StoredValue,
+  value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, PrependList(key, value))
 }
@@ -678,7 +647,7 @@ pub fn get_list_length(
 pub fn pop_list(
   actor_subject: process.Subject(Message),
   key: String,
-) -> Result(StoredValue, Nil) {
+) -> Result(RespValue, Nil) {
   actor.call(actor_subject, actor_timeout, PopList(key, _))
 }
 
