@@ -305,6 +305,25 @@ pub fn process_list_append(conn, key, values: List(String), actor_subject) {
   Nil
 }
 
+pub fn process_list_prepend(conn, key, values: List(String), actor_subject) {
+  let _ = case list.is_empty(values) {
+    False -> {
+      list.map(values, fn(value) {
+        prepend_list_value(actor_subject, key, StoredString(value))
+      })
+      let length = get_list_length(actor_subject, key) |> result.unwrap(0)
+      let response = Integer(length) |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    True -> {
+      let response = RedisError("Cannot push empty list") |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+  }
+
+  Nil
+}
+
 // Legacy list.at which shouldn't actually be used anymore due to performace
 pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
   case index < 0 {
@@ -403,6 +422,7 @@ pub type Message {
   Get(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
   Set(key: String, value: StoredValue)
   AppendList(key: String, value: StoredValue)
+  PrependList(key: String, value: StoredValue)
   GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
 }
 
@@ -449,6 +469,28 @@ fn handle_message(state: State, message: Message) {
     }
     Set(key, value) -> {
       let new_data = dict.insert(state.data, key, value)
+      let new_state = State(data: new_data)
+      actor.continue(new_state)
+    }
+    PrependList(key, value) -> {
+      let new_data =
+        dict.upsert(state.data, key, fn(stored) {
+          case stored {
+            None -> {
+              StoredList([value])
+            }
+            option.Some(stored_value) -> {
+              case stored_value {
+                StoredList(l) -> {
+                  StoredList([value, ..l])
+                }
+                _ -> {
+                  StoredList([])
+                }
+              }
+            }
+          }
+        })
       let new_state = State(data: new_data)
       actor.continue(new_state)
     }
@@ -538,6 +580,14 @@ pub fn append_list_value(
   actor.send(actor_subject, AppendList(key, value))
 }
 
+pub fn prepend_list_value(
+  actor_subject: process.Subject(Message),
+  key: String,
+  value: StoredValue,
+) -> Nil {
+  actor.send(actor_subject, PrependList(key, value))
+}
+
 pub fn get_list_length(
   actor_subject: process.Subject(Message),
   key: String,
@@ -574,6 +624,10 @@ pub fn main() {
             // RPUSH list_key "foo"
             ["RPUSH", key, ..values] ->
               process_list_append(conn, key, values, actor_subject)
+            //LPUSH list_key "a" "b" "c"
+            ["LPUSH", key, ..values] ->
+              process_list_prepend(conn, key, values, actor_subject)
+
             ["LRANGE", key, from, to] ->
               process_list_range(conn, key, from, to, actor_subject)
 
