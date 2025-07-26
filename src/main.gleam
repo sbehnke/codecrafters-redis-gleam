@@ -14,7 +14,7 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.1.2"
+const version = "0.1.5"
 
 const heartbeat_interval = 5000
 
@@ -187,6 +187,12 @@ pub fn uppercase_first(arr: List(String)) -> List(String) {
   }
 }
 
+fn send_response(value: RespValue, conn) -> Nil {
+  let response = value |> resp_to_string()
+  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+  Nil
+}
+
 fn command_to_list(msg: BitArray) -> Result(List(String), String) {
   bit_array.to_string(msg)
   |> result.unwrap("")
@@ -194,16 +200,11 @@ fn command_to_list(msg: BitArray) -> Result(List(String), String) {
 }
 
 fn process_ping(conn) {
-  let response = SimpleString("PONG") |> resp_to_string()
-  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-  Nil
+  SimpleString("PONG") |> send_response(conn)
 }
 
 fn process_echo(conn, rest) {
-  list.map(rest, fn(s) {
-    let response = BulkString(s) |> resp_to_string()
-    let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-  })
+  list.map(rest, fn(s) { BulkString(s) |> send_response(conn) })
   Nil
 }
 
@@ -218,8 +219,7 @@ fn process_set_with_ttl(
     True -> {
       // No TTL
       set_value(actor_subject, key, BulkString(value))
-      let response = SimpleString("OK") |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      SimpleString("OK") |> send_response(conn)
     }
     False -> {
       // With TTL
@@ -234,42 +234,29 @@ fn process_set_with_ttl(
       let stored = WithTTL(BulkString(value), expire)
 
       set_value(actor_subject, key, stored)
-      let response = SimpleString("OK") |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      SimpleString("OK") |> send_response(conn)
     }
   }
-  Nil
 }
 
 fn process_list_length(conn, key: String, actor_subject) {
-  let length = get_list_length(actor_subject, key) |> result.unwrap(0)
-  let response = Integer(length) |> resp_to_string()
-  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-
-  Nil
+  get_list_length(actor_subject, key)
+  |> result.unwrap(0)
+  |> Integer
+  |> send_response(conn)
 }
 
 fn process_list_pop(conn, key: String, qty: String, actor_subject) {
   let stored = pop_list(actor_subject, key, qty)
   let _ = case stored {
-    Error(_) -> {
-      let response = Null |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-    }
-    Ok(value) -> {
-      let response = value |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-    }
+    Error(_) -> Null |> send_response(conn)
+    Ok(value) -> value |> send_response(conn)
   }
-  Nil
 }
 
 fn process_get(conn, key: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
-    Error(_) -> {
-      let response = Null |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-    }
+    Error(_) -> Null |> send_response(conn)
     Ok(value) -> {
       case value {
         Array(_)
@@ -277,31 +264,20 @@ fn process_get(conn, key: String, actor_subject) {
         | Integer(_)
         | RedisError(_)
         | SimpleString(_)
-        | Null -> {
-          let response = value |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
+        | Null -> value |> send_response(conn)
         WithTTL(value, e) -> {
           let now = timestamp.system_time()
           case timestamp.compare(now, e) {
             order.Eq | order.Gt -> {
               let _ = delete_value(actor_subject, key)
-              let response = Null |> resp_to_string()
-              let assert Ok(_) =
-                glisten.send(conn, bytes_tree.from_string(response))
+              Null |> send_response(conn)
             }
-            order.Lt -> {
-              let response = value |> resp_to_string()
-              let assert Ok(_) =
-                glisten.send(conn, bytes_tree.from_string(response))
-            }
+            order.Lt -> value |> send_response(conn)
           }
         }
       }
     }
   }
-  Nil
 }
 
 fn process_list_append(conn, key, values: List(String), actor_subject) {
@@ -310,17 +286,13 @@ fn process_list_append(conn, key, values: List(String), actor_subject) {
       list.map(values, fn(value) {
         append_list_value(actor_subject, key, BulkString(value))
       })
-      let length = get_list_length(actor_subject, key) |> result.unwrap(0)
-      let response = Integer(length) |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      get_list_length(actor_subject, key)
+      |> result.unwrap(0)
+      |> Integer
+      |> send_response(conn)
     }
-    True -> {
-      let response = RedisError("Cannot push empty list") |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-    }
+    True -> RedisError("Cannot push empty list") |> send_response(conn)
   }
-
-  Nil
 }
 
 fn process_list_prepend(conn, key, values: List(String), actor_subject) {
@@ -329,40 +301,21 @@ fn process_list_prepend(conn, key, values: List(String), actor_subject) {
       list.map(values, fn(value) {
         prepend_list_value(actor_subject, key, BulkString(value))
       })
-      let length = get_list_length(actor_subject, key) |> result.unwrap(0)
-      let response = Integer(length) |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      get_list_length(actor_subject, key)
+      |> result.unwrap(0)
+      |> Integer
+      |> send_response(conn)
     }
     True -> {
-      let response = RedisError("Cannot push empty list") |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      RedisError("Cannot push empty list") |> send_response(conn)
     }
   }
-
-  Nil
 }
-
-// // Legacy list.at which shouldn't actually be used anymore due to performace
-// pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
-//   case index < 0 {
-//     True -> None
-//     False ->
-//       case list {
-//         [] -> None
-//         [x, ..rest] ->
-//           case index == 0 {
-//             True -> Some(x)
-//             False -> list_at(rest, index - 1)
-//           }
-//       }
-//   }
-// }
 
 fn process_list_range(conn, key, from: String, to: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> {
-      let response = Array([]) |> resp_to_string()
-      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+      Array([]) |> send_response(conn)
     }
     Ok(value) -> {
       case value {
@@ -410,22 +363,12 @@ fn process_list_range(conn, key, from: String, to: String, actor_subject) {
                     Ok(v) -> list.append(acc, [v])
                   }
                 })
-              let response = Array(items) |> resp_to_string()
-              let assert Ok(_) =
-                glisten.send(conn, bytes_tree.from_string(response))
+              Array(items) |> send_response(conn)
             }
-            False -> {
-              let response = Array([]) |> resp_to_string()
-              let assert Ok(_) =
-                glisten.send(conn, bytes_tree.from_string(response))
-            }
+            False -> Array([]) |> send_response(conn)
           }
         }
-        _ -> {
-          let response = Array([]) |> resp_to_string()
-          let assert Ok(_) =
-            glisten.send(conn, bytes_tree.from_string(response))
-        }
+        _ -> Array([]) |> send_response(conn)
       }
     }
   }
@@ -433,9 +376,7 @@ fn process_list_range(conn, key, from: String, to: String, actor_subject) {
 }
 
 fn process_unknown_command(conn, cmd) {
-  let response = RedisError("Unsupported command " <> cmd) |> resp_to_string()
-  let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
-  Nil
+  RedisError("Unsupported command " <> cmd) |> send_response(conn)
 }
 
 type State {
