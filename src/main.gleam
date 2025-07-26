@@ -14,7 +14,7 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.1.0"
+const version = "0.1.2"
 
 const heartbeat_interval = 5000
 
@@ -250,8 +250,8 @@ fn process_list_length(conn, key: String, actor_subject) {
   Nil
 }
 
-fn process_list_pop(conn, key: String, actor_subject) {
-  let stored = pop_list(actor_subject, key)
+fn process_list_pop(conn, key: String, qty: String, actor_subject) {
+  let stored = pop_list(actor_subject, key, qty)
   let _ = case stored {
     Error(_) -> {
       let response = Null |> resp_to_string()
@@ -435,7 +435,11 @@ pub type Message {
   AppendList(key: String, value: RespValue)
   PrependList(key: String, value: RespValue)
   GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
-  PopList(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
+  PopList(
+    key: String,
+    qty: String,
+    reply_with: process.Subject(Result(RespValue, Nil)),
+  )
 }
 
 // Actor loop function
@@ -552,7 +556,7 @@ fn handle_message(state: State, message: Message) {
       }
       actor.continue(state)
     }
-    PopList(key, client) -> {
+    PopList(key, qty, client) -> {
       let result = dict.get(state.data, key)
       let new_state = case result {
         Error(_) -> {
@@ -562,16 +566,27 @@ fn handle_message(state: State, message: Message) {
         Ok(stored) -> {
           case stored {
             Array(l) -> {
-              let new_list = case l {
-                [first, ..rest] -> {
-                  actor.send(client, Ok(first))
-                  rest
+              let quantity = int.parse(qty) |> result.unwrap(0)
+              let new_list = case quantity > 0 {
+                True -> {
+                  let #(popped, remaining) = list.split(l, quantity)
+                  actor.send(client, Ok(Array(popped)))
+                  remaining
                 }
-                [] -> {
-                  actor.send(client, Ok(Null))
-                  []
+                False -> {
+                  case l {
+                    [first, ..rest] -> {
+                      actor.send(client, Ok(first))
+                      rest
+                    }
+                    [] -> {
+                      actor.send(client, Ok(Null))
+                      []
+                    }
+                  }
                 }
               }
+
               let new_data = dict.insert(state.data, key, Array(new_list))
               State(data: new_data)
             }
@@ -647,8 +662,9 @@ pub fn get_list_length(
 pub fn pop_list(
   actor_subject: process.Subject(Message),
   key: String,
+  qty: String,
 ) -> Result(RespValue, Nil) {
-  actor.call(actor_subject, actor_timeout, PopList(key, _))
+  actor.call(actor_subject, actor_timeout, PopList(key, qty, _))
 }
 
 pub fn main() {
@@ -686,7 +702,10 @@ pub fn main() {
             ["LRANGE", key, from, to] ->
               process_list_range(conn, key, from, to, actor_subject)
             ["LLEN", key] -> process_list_length(conn, key, actor_subject)
-            ["LPOP", key] -> process_list_pop(conn, key, actor_subject)
+            ["LPOP", key] -> process_list_pop(conn, key, "", actor_subject)
+            ["LPOP", key, qty] ->
+              process_list_pop(conn, key, qty, actor_subject)
+
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
           }
