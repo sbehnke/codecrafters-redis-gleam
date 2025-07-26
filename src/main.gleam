@@ -14,7 +14,7 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.0.7"
+const version = "0.0.8"
 
 const heartbeat_interval = 5000
 
@@ -24,6 +24,7 @@ pub type StoredValue {
   StoredString(String)
   StoredList(List(StoredValue))
   StoredStringWithTTL(String, timestamp.Timestamp)
+  Nil
 }
 
 pub type RespValue {
@@ -254,6 +255,40 @@ fn process_list_length(conn, key: String, actor_subject) {
   Nil
 }
 
+fn process_list_pop(conn, key: String, actor_subject) {
+  let stored = pop_list(actor_subject, key)
+  let _ = case stored {
+    Error(_) -> {
+      let response = Null |> resp_to_string()
+      let assert Ok(_) = glisten.send(conn, bytes_tree.from_string(response))
+    }
+    Ok(value) -> {
+      case value {
+        Nil -> {
+          let response = Null |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
+        StoredList(_l) -> {
+          // TODO: Fix this
+          let response = Null |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+          // let response = Array(l) |> resp_to_string()
+          // let assert Ok(_) =
+          //   glisten.send(conn, bytes_tree.from_string(response))
+        }
+        StoredString(s) | StoredStringWithTTL(s, _) -> {
+          let response = BulkString(s) |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
+      }
+    }
+  }
+  Nil
+}
+
 fn process_get(conn, key: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> {
@@ -262,6 +297,11 @@ fn process_get(conn, key: String, actor_subject) {
     }
     Ok(value) -> {
       case value {
+        Nil -> {
+          let response = Null |> resp_to_string()
+          let assert Ok(_) =
+            glisten.send(conn, bytes_tree.from_string(response))
+        }
         StoredList(_) -> {
           let response = RedisError("Unimplemented") |> resp_to_string()
           let assert Ok(_) =
@@ -432,6 +472,7 @@ pub type Message {
   AppendList(key: String, value: StoredValue)
   PrependList(key: String, value: StoredValue)
   GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
+  PopList(key: String, reply_with: process.Subject(Result(StoredValue, Nil)))
 }
 
 // Actor loop function
@@ -447,6 +488,7 @@ fn handle_message(state: State, message: Message) {
       let new_data =
         dict.filter(state.data, fn(_, value) -> Bool {
           case value {
+            Nil -> False
             StoredList(_) -> True
             StoredString(_) -> True
             StoredStringWithTTL(key, expire) -> {
@@ -541,6 +583,36 @@ fn handle_message(state: State, message: Message) {
       }
       actor.continue(state)
     }
+    PopList(key, client) -> {
+      let result = dict.get(state.data, key)
+      let new_state = case result {
+        Error(_) -> {
+          actor.send(client, Ok(Nil))
+          state
+        }
+        Ok(stored) -> {
+          case stored {
+            StoredList(l) -> {
+              let new_list = case l {
+                [first, ..rest] -> {
+                  actor.send(client, Ok(first))
+                  rest
+                }
+                [] -> {
+                  actor.send(client, Ok(Nil))
+                  []
+                }
+              }
+              let new_data = dict.insert(state.data, key, StoredList(new_list))
+              State(data: new_data)
+            }
+            _ -> state
+          }
+        }
+      }
+
+      actor.continue(new_state)
+    }
     Delete(key) -> {
       let new_data = dict.delete(state.data, key)
       let new_state = State(data: new_data)
@@ -603,6 +675,13 @@ pub fn get_list_length(
   actor.call(actor_subject, actor_timeout, GetListLength(key, _))
 }
 
+pub fn pop_list(
+  actor_subject: process.Subject(Message),
+  key: String,
+) -> Result(StoredValue, Nil) {
+  actor.call(actor_subject, actor_timeout, PopList(key, _))
+}
+
 pub fn main() {
   io.println("Redis: Gleam Edition " <> version)
 
@@ -638,7 +717,7 @@ pub fn main() {
             ["LRANGE", key, from, to] ->
               process_list_range(conn, key, from, to, actor_subject)
             ["LLEN", key] -> process_list_length(conn, key, actor_subject)
-
+            ["LPOP", key] -> process_list_pop(conn, key, actor_subject)
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
           }
