@@ -437,166 +437,182 @@ type Message {
   )
 }
 
-// Actor loop function
-fn handle_message(state: State, message: Message) {
-  case message {
-    Heartbeat(subject, delay) -> {
-      let _now =
-        timestamp.system_time()
-        |> timestamp.to_rfc3339(duration.hours(0))
-        |> string.pad_end(to: 30, with: "0")
-      // |> echo
-      // io.println("[" <> now <> "] Actor heartbeat...")
+fn on_heartbeat(subject, delay, state: State) -> actor.Next(State, b) {
+  let _now =
+    timestamp.system_time()
+    |> timestamp.to_rfc3339(duration.hours(0))
+    |> string.pad_end(to: 30, with: "0")
+  // |> echo
+  // io.println("[" <> now <> "] Actor heartbeat...")
 
-      let new_data =
-        dict.filter(state.data, fn(key, value) -> Bool {
-          case value {
-            Array(_)
-            | BulkString(_)
-            | Integer(_)
-            | Null
-            | RedisError(_)
-            | SimpleString(_) -> {
-              True
+  let new_data =
+    dict.filter(state.data, fn(key, value) -> Bool {
+      case value {
+        Array(_)
+        | BulkString(_)
+        | Integer(_)
+        | Null
+        | RedisError(_)
+        | SimpleString(_) -> {
+          True
+        }
+        WithTTL(_, expire) -> {
+          case
+            duration.to_seconds(timestamp.difference(
+              timestamp.system_time(),
+              expire,
+            ))
+            >=. 0.0
+          {
+            False -> {
+              io.println("TTL expired for: " <> key)
+              False
             }
-            WithTTL(_, expire) -> {
-              case
-                duration.to_seconds(timestamp.difference(
-                  timestamp.system_time(),
-                  expire,
-                ))
-                >=. 0.0
-              {
-                False -> {
-                  io.println("TTL expired for: " <> key)
-                  False
-                }
-                True -> True
-              }
-            }
+            True -> True
           }
-        })
-      let new_state = State(data: new_data)
-      process.send_after(subject, delay, Heartbeat(subject, delay))
-      actor.continue(new_state)
-    }
-    Get(key, client) -> {
-      let result = dict.get(state.data, key)
-      actor.send(client, result)
-      actor.continue(state)
-    }
-    Set(key, value) -> {
-      let new_data = dict.insert(state.data, key, value)
-      let new_state = State(data: new_data)
-      actor.continue(new_state)
-    }
-    PrependList(key, value) -> {
-      let new_data =
-        dict.upsert(state.data, key, fn(stored) {
-          case stored {
-            None -> {
-              Array([value])
-            }
-            option.Some(stored_value) -> {
-              case stored_value {
-                Array(l) -> {
-                  Array([value, ..l])
-                }
-                _ -> {
-                  Array([])
-                }
-              }
-            }
-          }
-        })
-      let new_state = State(data: new_data)
-      actor.continue(new_state)
-    }
-    AppendList(key, value) -> {
-      let new_data =
-        dict.upsert(state.data, key, fn(stored) {
-          case stored {
-            None -> {
-              Array([value])
-            }
-            option.Some(stored_value) -> {
-              case stored_value {
-                Array(l) -> {
-                  Array(list.append(l, [value]))
-                }
-                _ -> {
-                  Array([])
-                }
-              }
-            }
-          }
-        })
-      let new_state = State(data: new_data)
-      actor.continue(new_state)
-    }
-    GetListLength(key, client) -> {
-      let result = dict.get(state.data, key)
-      case result {
-        Error(_) -> actor.send(client, Ok(0))
-        Ok(stored) -> {
-          case stored {
+        }
+      }
+    })
+  let new_state = State(data: new_data)
+  process.send_after(subject, delay, Heartbeat(subject, delay))
+  actor.continue(new_state)
+}
+
+fn on_get(key, client, state: State) -> actor.Next(State, b) {
+  let result = dict.get(state.data, key)
+  actor.send(client, result)
+  actor.continue(state)
+}
+
+fn on_set(key, value, state: State) -> actor.Next(State, b) {
+  let new_data = dict.insert(state.data, key, value)
+  let new_state = State(data: new_data)
+  actor.continue(new_state)
+}
+
+fn on_prepend_list(key, value, state: State) -> actor.Next(State, b) {
+  let new_data =
+    dict.upsert(state.data, key, fn(stored) {
+      case stored {
+        None -> {
+          Array([value])
+        }
+        option.Some(stored_value) -> {
+          case stored_value {
             Array(l) -> {
-              actor.send(client, Ok(list.length(l)))
+              Array([value, ..l])
             }
             _ -> {
-              actor.send(client, Ok(0))
+              Array([])
             }
           }
         }
       }
-      actor.continue(state)
-    }
-    PopList(key, qty, client) -> {
-      let result = dict.get(state.data, key)
-      let new_state = case result {
-        Error(_) -> {
-          actor.send(client, Ok(Null))
-          state
+    })
+  let new_state = State(data: new_data)
+  actor.continue(new_state)
+}
+
+fn on_append_list(key, value, state: State) -> actor.Next(State, b) {
+  let new_data =
+    dict.upsert(state.data, key, fn(stored) {
+      case stored {
+        None -> {
+          Array([value])
         }
-        Ok(stored) -> {
-          case stored {
+        option.Some(stored_value) -> {
+          case stored_value {
             Array(l) -> {
-              let quantity = int.parse(qty) |> result.unwrap(0)
-              let new_list = case quantity > 0 {
-                True -> {
-                  let #(popped, remaining) = list.split(l, quantity)
-                  actor.send(client, Ok(Array(popped)))
-                  remaining
+              Array(list.append(l, [value]))
+            }
+            _ -> {
+              Array([])
+            }
+          }
+        }
+      }
+    })
+  let new_state = State(data: new_data)
+  actor.continue(new_state)
+}
+
+fn on_get_list_length(key, client, state: State) -> actor.Next(State, b) {
+  let result = dict.get(state.data, key)
+  case result {
+    Error(_) -> actor.send(client, Ok(0))
+    Ok(stored) -> {
+      case stored {
+        Array(l) -> {
+          actor.send(client, Ok(list.length(l)))
+        }
+        _ -> {
+          actor.send(client, Ok(0))
+        }
+      }
+    }
+  }
+  actor.continue(state)
+}
+
+fn on_pop_list(key, qty, client, state: State) -> actor.Next(State, b) {
+  let result = dict.get(state.data, key)
+  let new_state = case result {
+    Error(_) -> {
+      actor.send(client, Ok(Null))
+      state
+    }
+    Ok(stored) -> {
+      case stored {
+        Array(l) -> {
+          let quantity = int.parse(qty) |> result.unwrap(0)
+          let new_list = case quantity > 0 {
+            True -> {
+              let #(popped, remaining) = list.split(l, quantity)
+              actor.send(client, Ok(Array(popped)))
+              remaining
+            }
+            False -> {
+              case l {
+                [first, ..rest] -> {
+                  actor.send(client, Ok(first))
+                  rest
                 }
-                False -> {
-                  case l {
-                    [first, ..rest] -> {
-                      actor.send(client, Ok(first))
-                      rest
-                    }
-                    [] -> {
-                      actor.send(client, Ok(Null))
-                      []
-                    }
-                  }
+                [] -> {
+                  actor.send(client, Ok(Null))
+                  []
                 }
               }
-
-              let new_data = dict.insert(state.data, key, Array(new_list))
-              State(data: new_data)
             }
-            _ -> state
           }
-        }
-      }
 
-      actor.continue(new_state)
+          let new_data = dict.insert(state.data, key, Array(new_list))
+          State(data: new_data)
+        }
+        _ -> state
+      }
     }
-    Delete(key) -> {
-      let new_data = dict.delete(state.data, key)
-      let new_state = State(data: new_data)
-      actor.continue(new_state)
-    }
+  }
+
+  actor.continue(new_state)
+}
+
+fn on_delete(key, state: State) -> actor.Next(State, b) {
+  let new_data = dict.delete(state.data, key)
+  let new_state = State(data: new_data)
+  actor.continue(new_state)
+}
+
+// Actor loop function
+fn handle_message(state: State, message: Message) -> actor.Next(State, b) {
+  case message {
+    Heartbeat(subject, delay) -> on_heartbeat(subject, delay, state)
+    Get(key, client) -> on_get(key, client, state)
+    Set(key, value) -> on_set(key, value, state)
+    PrependList(key, value) -> on_prepend_list(key, value, state)
+    AppendList(key, value) -> on_append_list(key, value, state)
+    GetListLength(key, client) -> on_get_list_length(key, client, state)
+    PopList(key, qty, client) -> on_pop_list(key, qty, client, state)
+    Delete(key) -> on_delete(key, state)
   }
 }
 
