@@ -5,7 +5,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{None}
 import gleam/order
 import gleam/otp/actor
 import gleam/result
@@ -342,21 +342,21 @@ fn process_list_prepend(conn, key, values: List(String), actor_subject) {
   Nil
 }
 
-// Legacy list.at which shouldn't actually be used anymore due to performace
-pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
-  case index < 0 {
-    True -> None
-    False ->
-      case list {
-        [] -> None
-        [x, ..rest] ->
-          case index == 0 {
-            True -> Some(x)
-            False -> list_at(rest, index - 1)
-          }
-      }
-  }
-}
+// // Legacy list.at which shouldn't actually be used anymore due to performace
+// pub fn list_at(in list: List(a), get index: Int) -> option.Option(a) {
+//   case index < 0 {
+//     True -> None
+//     False ->
+//       case list {
+//         [] -> None
+//         [x, ..rest] ->
+//           case index == 0 {
+//             True -> Some(x)
+//             False -> list_at(rest, index - 1)
+//           }
+//       }
+//   }
+// }
 
 fn process_list_range(conn, key, from: String, to: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
@@ -367,27 +367,47 @@ fn process_list_range(conn, key, from: String, to: String, actor_subject) {
     Ok(value) -> {
       case value {
         Array(s) -> {
-          let from = from |> int.parse() |> result.unwrap(0)
-          let to = to |> int.parse() |> result.unwrap(0)
+          let from_raw = from |> int.parse() |> result.unwrap(0)
+          let to_raw = to |> int.parse() |> result.unwrap(0)
           let length = list.length(s)
 
-          let #(to, from) = case to < 0, from < 0 {
-            True, True -> #(length + to, length + from)
-            True, False -> #(length + to, from)
-            False, True -> #(to, from + length)
-            False, False -> #(to, from)
+          // Convert negative indices to positive
+          let from_normalized = case from_raw < 0 {
+            True -> length + from_raw
+            False -> from_raw
           }
 
-          case from < to {
+          let to_normalized = case to_raw < 0 {
+            True -> length + to_raw
+            False -> to_raw
+          }
+
+          let from_clamped = case from_normalized < 0 {
+            True -> 0
+            False ->
+              case from_normalized >= length {
+                True -> length
+                False -> from_normalized
+              }
+          }
+
+          let to_clamped = case to_normalized < 0 {
+            True -> -1
+            False ->
+              case to_normalized >= length {
+                True -> length - 1
+                False -> to_normalized
+              }
+          }
+
+          case from_clamped <= to_clamped {
             True -> {
-              let range = list.range(from, to)
+              let indices = list.range(from_clamped, to_clamped)
               let items =
-                list.fold(range, [], fn(acc, index) {
-                  case list_at(s, index) {
-                    None -> acc
-                    Some(v) -> {
-                      list.append(acc, [v])
-                    }
+                list.fold(indices, [], fn(acc, index) {
+                  case list.drop(s, index) |> list.first() {
+                    Error(_) -> acc
+                    Ok(v) -> list.append(acc, [v])
                   }
                 })
               let response = Array(items) |> resp_to_string()
