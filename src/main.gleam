@@ -2,6 +2,7 @@ import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
 import gleam/erlang/process
+import gleam/float
 import gleam/int
 import gleam/io
 import gleam/list
@@ -14,11 +15,15 @@ import gleam/time/duration
 import gleam/time/timestamp
 import glisten.{Packet}
 
-const version = "0.1.5"
+pub type Config {
+  Config(version: String, heartbeat_interval: Int, actor_timeout: Int)
+}
 
-const heartbeat_interval = 5000
-
-const actor_timeout = 5000
+const config = Config(
+  version: "0.2.0",
+  heartbeat_interval: 5000,
+  actor_timeout: 5000,
+)
 
 pub type RespValue {
   SimpleString(String)
@@ -254,6 +259,32 @@ fn process_list_pop(conn, key: String, qty: String, actor_subject) {
   }
 }
 
+fn process_list_blpop(conn, key: String, timeout: String, actor_subject) {
+  let _ = case blocking_get_value(actor_subject, key, timeout) {
+    Error(_) -> Null |> send_response(conn)
+    Ok(value) -> {
+      case value {
+        Array(_)
+        | BulkString(_)
+        | Integer(_)
+        | RedisError(_)
+        | SimpleString(_)
+        | Null -> value |> send_response(conn)
+        WithTTL(value, e) -> {
+          let now = timestamp.system_time()
+          case timestamp.compare(now, e) {
+            order.Eq | order.Gt -> {
+              let _ = delete_value(actor_subject, key)
+              Null |> send_response(conn)
+            }
+            order.Lt -> value |> send_response(conn)
+          }
+        }
+      }
+    }
+  }
+}
+
 fn process_get(conn, key: String, actor_subject) {
   let _ = case get_value(actor_subject, key) {
     Error(_) -> Null |> send_response(conn)
@@ -380,14 +411,22 @@ fn process_unknown_command(conn, cmd) {
 }
 
 type State {
-  State(data: dict.Dict(String, RespValue))
+  State(
+    data: dict.Dict(String, RespValue),
+    blpop_clients: dict.Dict(
+      String,
+      List(process.Subject(Result(RespValue, Nil))),
+    ),
+  )
 }
 
 type Message {
   Heartbeat(subject: process.Subject(Message), delay: Int)
   Delete(key: String)
   Get(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
+  BlockingGet(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
   Set(key: String, value: RespValue)
+  ListAdded(key: String)
   AppendList(key: String, value: RespValue)
   PrependList(key: String, value: RespValue)
   GetListLength(key: String, reply_with: process.Subject(Result(Int, Nil)))
@@ -434,7 +473,7 @@ fn on_heartbeat(subject, delay, state: State) -> actor.Next(State, b) {
         }
       }
     })
-  let new_state = State(data: new_data)
+  let new_state = State(..state, data: new_data)
   process.send_after(subject, delay, Heartbeat(subject, delay))
   actor.continue(new_state)
 }
@@ -445,13 +484,65 @@ fn on_get(key, client, state: State) -> actor.Next(State, b) {
   actor.continue(state)
 }
 
-fn on_set(key, value, state: State) -> actor.Next(State, b) {
+fn on_blocking_get(
+  key: String,
+  client: process.Subject(Result(RespValue, Nil)),
+  state: State,
+) -> actor.Next(State, b) {
+  let result = dict.get(state.data, key)
+  case result {
+    Error(_) -> {
+      let new_list = case dict.get(state.blpop_clients, key) {
+        Error(_) -> [client]
+        Ok(clients) -> [client, ..clients]
+      }
+      let new_dict = dict.insert(state.blpop_clients, key, new_list)
+      let new_state =
+        State(..state, blpop_clients: new_dict)
+        |> echo
+      actor.continue(new_state)
+    }
+    Ok(_) -> {
+      on_pop_list_with_listkey(key, client, state)
+    }
+  }
+}
+
+fn on_set(key: String, value: RespValue, state: State) -> actor.Next(State, b) {
   let new_data = dict.insert(state.data, key, value)
-  let new_state = State(data: new_data)
+  let new_state = State(..state, data: new_data)
   actor.continue(new_state)
 }
 
-fn on_prepend_list(key, value, state: State) -> actor.Next(State, b) {
+fn on_list_added(key: String, state: State) -> actor.Next(State, b) {
+  echo #(key, "List added")
+  let clients = dict.get(state.blpop_clients, key)
+  case clients {
+    Error(_) -> actor.continue(state)
+    Ok(l) -> {
+      case l {
+        [] -> actor.continue(state)
+        [first, ..rest] -> {
+          echo first
+          let new_dict =
+            case rest {
+              [] -> dict.delete(state.blpop_clients, key)
+              _ -> dict.insert(state.blpop_clients, key, rest)
+            }
+            |> echo
+          let new_state = State(..state, blpop_clients: new_dict)
+          on_pop_list_with_listkey(key, first, new_state)
+        }
+      }
+    }
+  }
+}
+
+fn on_prepend_list(
+  key: String,
+  value: RespValue,
+  state: State,
+) -> actor.Next(State, b) {
   let new_data =
     dict.upsert(state.data, key, fn(stored) {
       case stored {
@@ -470,11 +561,15 @@ fn on_prepend_list(key, value, state: State) -> actor.Next(State, b) {
         }
       }
     })
-  let new_state = State(data: new_data)
+  let new_state = State(..state, data: new_data)
   actor.continue(new_state)
 }
 
-fn on_append_list(key, value, state: State) -> actor.Next(State, b) {
+fn on_append_list(
+  key: String,
+  value: RespValue,
+  state: State,
+) -> actor.Next(State, b) {
   let new_data =
     dict.upsert(state.data, key, fn(stored) {
       case stored {
@@ -493,11 +588,15 @@ fn on_append_list(key, value, state: State) -> actor.Next(State, b) {
         }
       }
     })
-  let new_state = State(data: new_data)
+  let new_state = State(..state, data: new_data)
   actor.continue(new_state)
 }
 
-fn on_get_list_length(key, client, state: State) -> actor.Next(State, b) {
+fn on_get_list_length(
+  key: String,
+  client: process.Subject(Result(Int, nil)),
+  state: State,
+) -> actor.Next(State, b) {
   let result = dict.get(state.data, key)
   case result {
     Error(_) -> actor.send(client, Ok(0))
@@ -515,7 +614,12 @@ fn on_get_list_length(key, client, state: State) -> actor.Next(State, b) {
   actor.continue(state)
 }
 
-fn on_pop_list(key, qty, client, state: State) -> actor.Next(State, b) {
+fn on_pop_list(
+  key: String,
+  qty: String,
+  client: process.Subject(Result(RespValue, Nil)),
+  state: State,
+) -> actor.Next(State, b) {
   let result = dict.get(state.data, key)
   let new_state = case result {
     Error(_) -> {
@@ -546,8 +650,11 @@ fn on_pop_list(key, qty, client, state: State) -> actor.Next(State, b) {
             }
           }
 
-          let new_data = dict.insert(state.data, key, Array(new_list))
-          State(data: new_data)
+          let new_data = case list.is_empty(new_list) {
+            False -> dict.insert(state.data, key, Array(new_list))
+            True -> dict.delete(state.data, key)
+          }
+          State(..state, data: new_data)
         }
         _ -> state
       }
@@ -557,18 +664,60 @@ fn on_pop_list(key, qty, client, state: State) -> actor.Next(State, b) {
   actor.continue(new_state)
 }
 
-fn on_delete(key, state: State) -> actor.Next(State, b) {
+fn on_pop_list_with_listkey(
+  key: String,
+  client: process.Subject(Result(RespValue, Nil)),
+  state: State,
+) -> actor.Next(State, b) {
+  let result = dict.get(state.data, key)
+  let new_state = case result {
+    Error(_) -> {
+      actor.send(client, Ok(Null))
+      state
+    }
+    Ok(stored) -> {
+      case stored {
+        Array(l) -> {
+          let new_list = case l {
+            [first, ..rest] -> {
+              actor.send(client, Ok(Array([BulkString(key), first])))
+              rest
+            }
+            [] -> {
+              actor.send(client, Ok(Null))
+              []
+            }
+          }
+
+          let new_data = case list.is_empty(new_list) {
+            False -> dict.insert(state.data, key, Array(new_list))
+            True -> dict.delete(state.data, key)
+          }
+          State(..state, data: new_data)
+        }
+        _ -> state
+      }
+    }
+  }
+
+  actor.continue(new_state)
+}
+
+fn on_delete(key: String, state: State) -> actor.Next(State, b) {
   let new_data = dict.delete(state.data, key)
-  let new_state = State(data: new_data)
+  let new_state = State(..state, data: new_data)
   actor.continue(new_state)
 }
 
 // Actor loop function
 fn handle_message(state: State, message: Message) -> actor.Next(State, b) {
+  // echo message
   case message {
     Heartbeat(subject, delay) -> on_heartbeat(subject, delay, state)
     Get(key, client) -> on_get(key, client, state)
+    BlockingGet(key, client) -> on_blocking_get(key, client, state)
     Set(key, value) -> on_set(key, value, state)
+    ListAdded(key) -> on_list_added(key, state)
     PrependList(key, value) -> on_prepend_list(key, value, state)
     AppendList(key, value) -> on_append_list(key, value, state)
     GetListLength(key, client) -> on_get_list_length(key, client, state)
@@ -580,7 +729,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, b) {
 // Start the actor
 fn start() {
   let assert Ok(actor) =
-    actor.new(State(data: dict.new()))
+    actor.new(State(data: dict.new(), blpop_clients: dict.new()))
     |> actor.on_message(handle_message)
     |> actor.start()
   actor.data
@@ -591,7 +740,23 @@ fn get_value(
   actor_subject: process.Subject(Message),
   key: String,
 ) -> Result(RespValue, Nil) {
-  actor.call(actor_subject, actor_timeout, Get(key, _))
+  actor.call(actor_subject, config.actor_timeout, Get(key, _))
+}
+
+fn blocking_get_value(
+  actor_subject: process.Subject(Message),
+  key: String,
+  timeout: String,
+) -> Result(RespValue, Nil) {
+  let delay =
+    { float.parse(timeout) |> result.unwrap(0.0) } *. 1000.0 |> float.round()
+  case delay == 0 {
+    False -> {
+      // This will panic if the delay is exceeded
+      process.call(actor_subject, delay, BlockingGet(key, _))
+    }
+    True -> process.call_forever(actor_subject, BlockingGet(key, _))
+  }
 }
 
 fn delete_value(actor_subject: process.Subject(Message), key: String) -> Nil {
@@ -614,6 +779,7 @@ fn append_list_value(
   value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, AppendList(key, value))
+  actor.send(actor_subject, ListAdded(key))
 }
 
 fn prepend_list_value(
@@ -622,13 +788,14 @@ fn prepend_list_value(
   value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, PrependList(key, value))
+  actor.send(actor_subject, ListAdded(key))
 }
 
 fn get_list_length(
   actor_subject: process.Subject(Message),
   key: String,
 ) -> Result(Int, Nil) {
-  actor.call(actor_subject, actor_timeout, GetListLength(key, _))
+  actor.call(actor_subject, config.actor_timeout, GetListLength(key, _))
 }
 
 fn pop_list(
@@ -636,17 +803,17 @@ fn pop_list(
   key: String,
   qty: String,
 ) -> Result(RespValue, Nil) {
-  actor.call(actor_subject, actor_timeout, PopList(key, qty, _))
+  actor.call(actor_subject, config.actor_timeout, PopList(key, qty, _))
 }
 
 pub fn main() {
-  io.println("Redis: Gleam Edition " <> version)
+  io.println("Redis: Gleam Edition " <> config.version)
 
   let actor_subject = start()
   process.send_after(
     actor_subject,
-    heartbeat_interval,
-    Heartbeat(actor_subject, heartbeat_interval),
+    config.heartbeat_interval,
+    Heartbeat(actor_subject, config.heartbeat_interval),
   )
   let assert Ok(_) =
     glisten.new(fn(_conn) { #(dict.new(), None) }, fn(state, msg, conn) {
@@ -677,7 +844,8 @@ pub fn main() {
             ["LPOP", key] -> process_list_pop(conn, key, "", actor_subject)
             ["LPOP", key, qty] ->
               process_list_pop(conn, key, qty, actor_subject)
-
+            ["BLPOP", key, timeout] ->
+              process_list_blpop(conn, key, timeout, actor_subject)
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
           }
