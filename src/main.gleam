@@ -314,11 +314,15 @@ fn process_get(conn, key: String, actor_subject) {
 fn process_list_append(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
+      let length =
+        get_list_length(actor_subject, key)
+        |> result.unwrap(0)
+
       list.map(values, fn(value) {
         append_list_value(actor_subject, key, BulkString(value))
       })
-      get_list_length(actor_subject, key)
-      |> result.unwrap(0)
+
+      length + list.length(values)
       |> Integer
       |> send_response(conn)
     }
@@ -425,6 +429,10 @@ type Message {
   Delete(key: String)
   Get(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
   BlockingGet(key: String, reply_with: process.Subject(Result(RespValue, Nil)))
+  RemoveBlockingClient(
+    key: String,
+    reply_with: process.Subject(Result(RespValue, Nil)),
+  )
   Set(key: String, value: RespValue)
   ListAdded(key: String)
   AppendList(key: String, value: RespValue)
@@ -523,14 +531,12 @@ fn on_list_added(key: String, state: State) -> actor.Next(State, b) {
       case l {
         [] -> actor.continue(state)
         [first, ..rest] -> {
-          echo first
-          let new_dict =
-            case rest {
-              [] -> dict.delete(state.blpop_clients, key)
-              _ -> dict.insert(state.blpop_clients, key, rest)
-            }
-            |> echo
-          let new_state = State(..state, blpop_clients: new_dict)
+          // echo first
+          let new_dict = case rest {
+            [] -> dict.delete(state.blpop_clients, key)
+            _ -> dict.insert(state.blpop_clients, key, rest)
+          }
+          let new_state = State(state.data, blpop_clients: new_dict)
           on_pop_list_with_listkey(key, first, new_state)
         }
       }
@@ -562,7 +568,7 @@ fn on_prepend_list(
       }
     })
   let new_state = State(..state, data: new_data)
-  actor.continue(new_state)
+  on_list_added(key, new_state)
 }
 
 fn on_append_list(
@@ -589,7 +595,7 @@ fn on_append_list(
       }
     })
   let new_state = State(..state, data: new_data)
-  actor.continue(new_state)
+  on_list_added(key, new_state)
 }
 
 fn on_get_list_length(
@@ -709,6 +715,28 @@ fn on_delete(key: String, state: State) -> actor.Next(State, b) {
   actor.continue(new_state)
 }
 
+fn on_remove_blocking_client(
+  key: String,
+  client: process.Subject(Result(RespValue, Nil)),
+  state: State,
+) -> actor.Next(State, b) {
+  echo #("Client removing: ", client)
+  let new_list = case dict.get(state.blpop_clients, key) {
+    Error(_) -> []
+    Ok(clients) -> {
+      list.filter(clients, fn(c) { c == client })
+    }
+  }
+  let new_dict = case list.is_empty(new_list) {
+    False -> dict.insert(state.blpop_clients, key, new_list)
+    True -> dict.delete(state.blpop_clients, key)
+  }
+  let new_state = State(..state, blpop_clients: new_dict)
+  actor.send(client, Ok(Null))
+  echo #("New State: ", new_state)
+  actor.continue(new_state)
+}
+
 // Actor loop function
 fn handle_message(state: State, message: Message) -> actor.Next(State, b) {
   // echo message
@@ -716,6 +744,8 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, b) {
     Heartbeat(subject, delay) -> on_heartbeat(subject, delay, state)
     Get(key, client) -> on_get(key, client, state)
     BlockingGet(key, client) -> on_blocking_get(key, client, state)
+    RemoveBlockingClient(key, client) ->
+      on_remove_blocking_client(key, client, state)
     Set(key, value) -> on_set(key, value, state)
     ListAdded(key) -> on_list_added(key, state)
     PrependList(key, value) -> on_prepend_list(key, value, state)
@@ -743,6 +773,37 @@ fn get_value(
   actor.call(actor_subject, config.actor_timeout, Get(key, _))
 }
 
+fn perform_call_with_result(
+  subject: process.Subject(message),
+  make_request: fn(process.Subject(reply)) -> message,
+  run_selector: fn(process.Selector(reply)) -> Result(reply, Nil),
+) -> Result(reply, Nil) {
+  let reply_subject = process.new_subject()
+  let assert Ok(callee) = process.subject_owner(subject)
+    as "Callee subject had no owner"
+
+  // Monitor the callee process so we can tell if it goes down (meaning we
+  // won't get a reply)
+  let monitor = process.monitor(callee)
+
+  // Send the request to the process over the channel
+  process.send(subject, make_request(reply_subject))
+
+  // Await a reply or handle failure modes (timeout, process down, etc)
+  let reply =
+    process.new_selector()
+    |> process.select(reply_subject)
+    |> process.select_specific_monitor(monitor, fn(down) {
+      panic as { "callee exited: " <> string.inspect(down) }
+    })
+    |> run_selector
+
+  // Demonitor the process and close the channels as we're done
+  process.demonitor_process(monitor)
+
+  reply
+}
+
 fn blocking_get_value(
   actor_subject: process.Subject(Message),
   key: String,
@@ -752,8 +813,22 @@ fn blocking_get_value(
     { float.parse(timeout) |> result.unwrap(0.0) } *. 1000.0 |> float.round()
   case delay == 0 {
     False -> {
-      // This will panic if the delay is exceeded
-      process.call(actor_subject, delay, BlockingGet(key, _))
+      case
+        perform_call_with_result(
+          actor_subject,
+          BlockingGet(key, _),
+          process.selector_receive(_, delay),
+        )
+      {
+        Error(_) -> {
+          process.call(
+            actor_subject,
+            config.actor_timeout,
+            RemoveBlockingClient(key, _),
+          )
+        }
+        Ok(r) -> r
+      }
     }
     True -> process.call_forever(actor_subject, BlockingGet(key, _))
   }
@@ -779,7 +854,6 @@ fn append_list_value(
   value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, AppendList(key, value))
-  actor.send(actor_subject, ListAdded(key))
 }
 
 fn prepend_list_value(
@@ -788,7 +862,6 @@ fn prepend_list_value(
   value: RespValue,
 ) -> Nil {
   actor.send(actor_subject, PrependList(key, value))
-  actor.send(actor_subject, ListAdded(key))
 }
 
 fn get_list_length(
@@ -854,6 +927,10 @@ pub fn main() {
       }
     })
     |> glisten.bind("0.0.0.0")
+    |> glisten.with_close(fn(state) {
+      echo state
+      Nil
+    })
     |> glisten.start(6379)
 
   process.sleep_forever()
