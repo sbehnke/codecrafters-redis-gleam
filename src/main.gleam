@@ -311,6 +311,29 @@ fn process_get(conn, key: String, actor_subject) {
   }
 }
 
+// string, list, set, zset, hash, and stream.
+fn get_resp_type_string(value: RespValue) -> RespValue {
+  case value {
+    Array(_) -> SimpleString("list")
+    BulkString(_) -> SimpleString("string")
+    Integer(_) -> SimpleString("string")
+    Null -> SimpleString("none")
+    RedisError(e) -> RedisError(e)
+    SimpleString(_) -> SimpleString("string")
+    WithTTL(v, _) -> get_resp_type_string(v)
+  }
+}
+
+fn process_type(conn, key: String, actor_subject) {
+  let _ = case get_value(actor_subject, key) {
+    Error(_) -> SimpleString("none") |> send_response(conn)
+    Ok(value) -> {
+      get_resp_type_string(value)
+      |> send_response(conn)
+    }
+  }
+}
+
 fn process_list_append(conn, key, values: List(String), actor_subject) {
   let _ = case list.is_empty(values) {
     False -> {
@@ -773,6 +796,12 @@ fn get_value(
   actor.call(actor_subject, config.actor_timeout, Get(key, _))
 }
 
+//
+// This might have a memory leak
+// When calling BLPOP that results in blocking then the ListAdd is called
+// prior to the timeout, it is possible that the timeout reply might not be
+// cleaned up correctly....
+//
 fn perform_call_with_result(
   subject: process.Subject(message),
   make_request: fn(process.Subject(reply)) -> message,
@@ -782,14 +811,9 @@ fn perform_call_with_result(
   let assert Ok(callee) = process.subject_owner(subject)
     as "Callee subject had no owner"
 
-  // Monitor the callee process so we can tell if it goes down (meaning we
-  // won't get a reply)
   let monitor = process.monitor(callee)
-
-  // Send the request to the process over the channel
   process.send(subject, make_request(reply_subject))
 
-  // Await a reply or handle failure modes (timeout, process down, etc)
   let reply =
     process.new_selector()
     |> process.select(reply_subject)
@@ -798,10 +822,32 @@ fn perform_call_with_result(
     })
     |> run_selector
 
-  // Demonitor the process and close the channels as we're done
   process.demonitor_process(monitor)
 
+  // // Optional: Drain any additional messages that might have arrived
+  // // This is especially important if you suspect multiple replies
+  // case reply {
+  //   Ok(_) -> drain_reply_subject(reply_subject)
+  //   Error(_) -> drain_reply_subject(reply_subject)
+  //   // Also drain on timeout
+  // }
+
   reply
+}
+
+// Helper function to drain remaining messages
+pub fn drain_reply_subject(subject: process.Subject(reply)) -> Nil {
+  let selector =
+    process.new_selector()
+    |> process.select(subject)
+
+  // Use selector_receive with 0ms timeout - non-blocking
+  case process.selector_receive(selector, within: 0) {
+    Ok(_) -> drain_reply_subject(subject)
+    // Recursively drain
+    Error(Nil) -> Nil
+    // No more messages (timeout)
+  }
 }
 
 fn blocking_get_value(
@@ -919,6 +965,7 @@ pub fn main() {
               process_list_pop(conn, key, qty, actor_subject)
             ["BLPOP", key, timeout] ->
               process_list_blpop(conn, key, timeout, actor_subject)
+            ["TYPE", key] -> process_type(conn, key, actor_subject)
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
           }
