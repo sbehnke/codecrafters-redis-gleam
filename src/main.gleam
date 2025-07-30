@@ -20,7 +20,7 @@ pub type Config {
 }
 
 const config = Config(
-  version: "0.2.0",
+  version: "0.3.0",
   heartbeat_interval: 5000,
   actor_timeout: 5000,
 )
@@ -32,6 +32,7 @@ pub type RespValue {
   BulkString(String)
   Array(List(RespValue))
   WithTTL(RespValue, timestamp.Timestamp)
+  Stream(String, dict.Dict(String, RespValue))
   Null
 }
 
@@ -182,6 +183,10 @@ pub fn resp_to_string(value: RespValue) -> String {
       let serialized = list.map(elements, resp_to_string) |> string.join("")
       "*" <> count <> "\r\n" <> serialized
     }
+    Stream(_id, _elements) -> {
+      // TODO: Format stream output
+      ""
+    }
   }
 }
 
@@ -269,6 +274,7 @@ fn process_list_blpop(conn, key: String, timeout: String, actor_subject) {
         | Integer(_)
         | RedisError(_)
         | SimpleString(_)
+        | Stream(_, _)
         | Null -> value |> send_response(conn)
         WithTTL(value, e) -> {
           let now = timestamp.system_time()
@@ -295,6 +301,7 @@ fn process_get(conn, key: String, actor_subject) {
         | Integer(_)
         | RedisError(_)
         | SimpleString(_)
+        | Stream(_, _)
         | Null -> value |> send_response(conn)
         WithTTL(value, e) -> {
           let now = timestamp.system_time()
@@ -321,6 +328,7 @@ fn get_resp_type_string(value: RespValue) -> RespValue {
     RedisError(e) -> RedisError(e)
     SimpleString(_) -> SimpleString("string")
     WithTTL(v, _) -> get_resp_type_string(v)
+    Stream(_, _) -> SimpleString("stream")
   }
 }
 
@@ -332,6 +340,35 @@ fn process_type(conn, key: String, actor_subject) {
       |> send_response(conn)
     }
   }
+}
+
+fn process_stream_add(conn, key, id, rest, actor_subject) {
+  // entries:
+  //   - id: 1526985054069-0 # (ID of the first entry)
+  //     temperature: 36 # (A key value pair in the first entry)
+  //     humidity: 95 # (Another key value pair in the first entry)
+
+  //   - id: 1526985054079-0 # (ID of the second entry)
+  //     temperature: 37 # (A key value pair in the first entry)
+  //     humidity: 94 # (Another key value pair in the first entry)
+
+  //   # ... (and so on)
+  //
+  let pairs = rest |> list.sized_chunk(2)
+  let values: dict.Dict(String, RespValue) =
+    list.fold(pairs, dict.new(), fn(acc, p) {
+      case p {
+        [key, value] -> {
+          dict.insert(acc, key, BulkString(value))
+        }
+        _ -> acc
+      }
+    })
+
+  let stored = Stream(id, values)
+  set_value(actor_subject, key, stored)
+  send_response(BulkString(id), conn)
+  Nil
 }
 
 fn process_list_append(conn, key, values: List(String), actor_subject) {
@@ -484,6 +521,7 @@ fn on_heartbeat(subject, delay, state: State) -> actor.Next(State, b) {
         | Integer(_)
         | Null
         | RedisError(_)
+        | Stream(_, _)
         | SimpleString(_) -> {
           True
         }
@@ -966,6 +1004,9 @@ pub fn main() {
             ["BLPOP", key, timeout] ->
               process_list_blpop(conn, key, timeout, actor_subject)
             ["TYPE", key] -> process_type(conn, key, actor_subject)
+            // redis-cli XADD stream_key 1526919030474-0 temperature 36 humidity 95
+            ["XADD", key, id, ..rest] ->
+              process_stream_add(conn, key, id, rest, actor_subject)
             [c] -> process_unknown_command(conn, c)
             _ -> process_unknown_command(conn, "UNKNOWN")
           }
